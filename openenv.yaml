@@ -1,0 +1,209 @@
+name: content-moderation-env
+version: "0.2.0"
+description: >
+  Content Moderation RL Environment — three tasks of increasing complexity
+  that simulate real decisions made by trust & safety teams at scale.
+
+  Task 1 (POMDP):        Single-post decisions under uncertainty.
+  Task 2 (Sequential RL): Multi-step user trajectory control.
+  Task 3 (System RL):    Platform-wide policy optimisation with fairness constraints.
+
+author: "Team Malhar"
+
+tasks:
+  - name: task1-single-post
+    description: >
+      Single post moderation under uncertainty (POMDP).
+      The agent receives an IMPERFECT noisy toxicity score and must decide
+      allow / warn / remove. True toxicity is hidden; the agent must learn
+      risk-aware decision making using confidence_level as a calibration signal.
+    difficulty: easy
+    max_steps: 1
+    score_range: [0.0, 1.0]
+    endpoint: "/reset?task=task1-single-post"
+    actions:
+      - allow
+      - warn
+      - remove
+    observation_fields:
+      - post_id
+      - text
+      - noisy_toxicity_score
+      - confidence_level
+      - follower_bucket
+      - step
+
+  - name: task2-user-trajectory
+    description: >
+      Sequential user behaviour management (True RL).
+      The agent moderates the SAME user across multiple posts.
+      Actions have delayed consequences: too lenient → user escalates;
+      too strict → user churns. Escalation level and violation history
+      give the agent memory of the user's past behaviour.
+    difficulty: medium
+    max_steps: 10
+    score_range: [0.0, 1.0]
+    endpoint: "/reset?task=task2-user-trajectory"
+    actions:
+      - allow
+      - warn
+      - restrict
+      - remove
+      - ban
+    observation_fields:
+      - post_id
+      - text
+      - noisy_toxicity_score
+      - confidence_level
+      - follower_bucket
+      - user_id
+      - day
+      - violation_history
+      - last_action
+      - escalation_level
+      - step
+
+  - name: task3-platform-policy
+    description: >
+      Platform-level policy optimisation (Multi-objective RL).
+      The agent adjusts global moderation strictness over 20 simulated days.
+      Each day, a real batch of posts is processed. Metrics are computed from
+      actual dataset labels and group A/B fairness splits.
+      The agent must balance four objectives: safety, engagement, retention,
+      and demographic fairness — exactly as real platforms must.
+    difficulty: hard
+    max_steps: 20
+    score_range: [0.0, 1.0]
+    endpoint: "/reset?task=task3-platform-policy"
+    actions:
+      - increase_strictness
+      - decrease_strictness
+      - keep_policy_same
+    observation_fields:
+      - current_day
+      - global_toxicity_rate
+      - engagement_score
+      - user_retention_rate
+      - moderation_strictness_level
+      - fairness_gap
+      - group_a_false_positive_rate
+      - group_b_false_positive_rate
+      - sample_post_text
+      - sample_toxicity_score
+      - sample_content_type
+      - step
+
+# ─── Global observation schema (Task 1 base; Tasks 2/3 extend this) ──────────
+observation_space:
+  type: object
+  description: "Post-level observation visible to the agent (Task 1 base fields)"
+  properties:
+    post_id:
+      type: integer
+      description: "Unique identifier for the post"
+    text:
+      type: string
+      description: "Raw post text content"
+    noisy_toxicity_score:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Imperfect model prediction — NOT ground truth"
+    confidence_level:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Model's self-reported confidence in its toxicity score"
+    follower_bucket:
+      type: integer
+      minimum: 0
+      maximum: 2
+      description: "Poster reach: 0=low (<1k), 1=mid (1k-100k), 2=high (>100k)"
+    step:
+      type: integer
+      description: "Current step within the episode"
+  # Task 2 additional fields
+  task2_extended:
+    user_id:           {type: integer}
+    day:               {type: integer}
+    violation_history: {type: integer, description: "Count of user's past violations"}
+    last_action:       {type: integer, description: "Agent's action on user's prior post (0-4)"}
+    escalation_level:  {type: integer, minimum: 0, maximum: 3}
+  # Task 3 additional fields (platform-level aggregated view)
+  task3_extended:
+    current_day:
+      type: integer
+    global_toxicity_rate:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Fraction of toxic posts that bypassed moderation"
+    engagement_score:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Fraction of safe posts correctly allowed"
+    user_retention_rate:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Proxy for user retention; penalised by false-positive rate"
+    moderation_strictness_level:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Current strictness level controlled by the agent"
+    fairness_gap:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "|group_A_FPR - group_B_FPR|; 0 = perfectly fair"
+    group_a_false_positive_rate:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+    group_b_false_positive_rate:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+    sample_post_text:         {type: string}
+    sample_toxicity_score:    {type: number, minimum: 0.0, maximum: 1.0}
+    sample_content_type:      {type: string}
+
+# ─── Action spaces per task ───────────────────────────────────────────────────
+action_space:
+  task1:
+    type: string
+    enum: [allow, warn, remove]
+    description: >
+      allow  — post stays visible, no action
+      warn   — post stays up with a warning label, user notified
+      remove — post taken down immediately
+  task2:
+    type: string
+    enum: [allow, warn, restrict, remove, ban]
+    description: >
+      allow    — no intervention
+      warn     — soft nudge, user notified
+      restrict — limit user's posting frequency
+      remove   — take down this specific post
+      ban      — remove user from platform (terminal action)
+  task3:
+    type: string
+    enum: [increase_strictness, decrease_strictness, keep_policy_same]
+    description: >
+      increase_strictness — raise auto-mod threshold (+0.1); removes more content
+      decrease_strictness — lower auto-mod threshold (-0.1); allows more content
+      keep_policy_same    — no change this day
+
+reward_range: [0.0, 1.0]
+
+tags:
+  - content-moderation
+  - trust-and-safety
+  - nlp
+  - pomdp
+  - sequential-rl
+  - multi-objective-rl
+  - fairness
+  - openenv
