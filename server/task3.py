@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict, Any, List
 
-from .models import Task3Observation, Task3Action, Task3StepResult, Task3ResetResult
+from ..models import Task3Observation, Task3Action, Task3StepResult, Task3ResetResult
 
 DATA_PATH = os.getenv(
     "DATASET_PATH",
@@ -47,12 +47,12 @@ class Task3Env:
     State: aggregated platform health metrics computed from a daily batch.
     Action: increase_strictness | decrease_strictness | keep_policy_same
 
-    Strictness (0.0–1.0) controls the auto-mod threshold:
-        threshold = 1.0 − strictness
+    Strictness (0.0-1.0) controls the auto-mod threshold:
+        threshold = 1.0 - strictness
     A post is auto-removed if noisy_toxicity_score > threshold.
 
-    High strictness → removes more content (good for safety, bad for engagement/fairness).
-    Low strictness  → allows more content (good for engagement, bad for safety).
+    High strictness -> removes more content (good for safety, bad for engagement/fairness).
+    Low strictness  -> allows more content (good for engagement, bad for safety).
     """
 
     def __init__(self, data_path: str = DATA_PATH, seed: Optional[int] = None):
@@ -76,9 +76,9 @@ class Task3Env:
         self._all_indices = list(range(len(self._df)))
         self.reset()
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     # OpenEnv interface
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
 
     def reset(self) -> Task3ResetResult:
         """Start a new 20-day episode with a clean platform state."""
@@ -108,15 +108,15 @@ class Task3Env:
         if self.is_done:
             raise RuntimeError("Episode is done. Call reset().")
 
-        # ── 1. Apply agent's policy adjustment ───────────────────────────────
+        # -- 1. Apply agent's policy adjustment -------------------------------
         action = action_model.action
         if action == "increase_strictness":
             self.strictness = min(1.0, round(self.strictness + 0.1, 2))
         elif action == "decrease_strictness":
             self.strictness = max(0.0, round(self.strictness - 0.1, 2))
-        # keep_policy_same → no change
+        # keep_policy_same -> no change
 
-        # ── 2. Simulate the day: sample a real batch and apply threshold ──────
+        # -- 2. Simulate the day: sample a real batch and apply threshold ------
         batch    = self._sample_batch()
         metrics  = self._compute_metrics_for_batch(batch, self.strictness)
         self._last_metrics = metrics
@@ -127,11 +127,11 @@ class Task3Env:
         self._group_b_fp  += metrics["_b_fp"]
         self._group_b_tot += metrics["_b_safe_total"]
 
-        # ── 3. Multi-objective reward ─────────────────────────────────────────
+        # -- 3. Multi-objective reward -----------------------------------------
         reward = self._compute_reward(metrics)
         self._episode_rewards.append(reward)
 
-        # ── 4. Episode boundary ───────────────────────────────────────────────
+        # -- 4. Episode boundary -----------------------------------------------
         self.current_day += 1
         if self.current_day > MAX_DAYS:
             self.is_done = True
@@ -185,14 +185,32 @@ class Task3Env:
             "fairness_gap":    round(m.get("fairness_gap", 0), 4),
         }
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     # Internal helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
 
     def _sample_batch(self) -> pd.DataFrame:
-        """Sample BATCH_SIZE posts uniformly from the dataset."""
-        idx = self._rng.choices(self._all_indices, k=BATCH_SIZE)
-        return self._df.iloc[idx].reset_index(drop=True)
+        """
+        Policy-dependent sampling (CRITICAL)
+        """
+        if self.strictness > 0.7:
+            # Strict platform -> users behave better
+            safe_posts = self._df[self._df["true_toxicity"] == 0]
+            toxic_posts = self._df[self._df["true_toxicity"] == 1]
+
+            safe_sample = safe_posts.sample(int(BATCH_SIZE * 0.7), replace=True)
+            toxic_sample = toxic_posts.sample(int(BATCH_SIZE * 0.3), replace=True)
+
+        else:
+            # Lenient platform -> more toxicity appears
+            safe_posts = self._df[self._df["true_toxicity"] == 0]
+            toxic_posts = self._df[self._df["true_toxicity"] == 1]
+
+            safe_sample = safe_posts.sample(int(BATCH_SIZE * 0.5), replace=True)
+            toxic_sample = toxic_posts.sample(int(BATCH_SIZE * 0.5), replace=True)
+
+        batch = pd.concat([safe_sample, toxic_sample])
+        return batch.sample(frac=1).reset_index(drop=True)
 
     def _compute_metrics_for_batch(
         self, batch: pd.DataFrame, strictness: float
@@ -201,7 +219,7 @@ class Task3Env:
         Simulate a day's auto-moderation and compute platform health metrics.
 
         Decision rule: auto-remove post if noisy_toxicity_score > threshold
-        where threshold = 1.0 − strictness.
+        where threshold = 1.0 - strictness.
 
         Returns a dict with all metric components plus internal counters
         (prefixed with _) for cumulative fairness tracking.
@@ -217,14 +235,14 @@ class Task3Env:
 
         true_tox  = batch["true_toxicity"].values
 
-        # ── Safety ───────────────────────────────────────────────────────────
+        # -- Safety -----------------------------------------------------------
         # Fraction of truly toxic posts that slipped through (false negatives)
         n_toxic = true_tox.sum()
         fn = ((true_tox == 1) & (decisions == 0)).sum()   # toxic + allowed = false neg
         miss_rate     = fn / n_toxic if n_toxic > 0 else 0.0
         safety_score  = 1.0 - miss_rate                   # higher = better
 
-        # ── Engagement ───────────────────────────────────────────────────────
+        # -- Engagement -------------------------------------------------------
         # Fraction of SAFE posts that were allowed (false positives hurt engagement)
         n_safe  = (true_tox == 0).sum()
         safe_allowed = ((true_tox == 0) & (decisions == 0)).sum()
@@ -233,11 +251,11 @@ class Task3Env:
         fp_rate    = 1.0 - engagement
         engagement = max(0.0, engagement - 0.1 * fp_rate)  # light engagement drag
 
-        # ── Retention ────────────────────────────────────────────────────────
+        # -- Retention --------------------------------------------------------
         # High false-positive rate erodes retention; harshness is quadratic
         retention = max(0.0, 1.0 - (fp_rate ** 1.5))
 
-        # ── Fairness — differential false-positive rate across groups ─────────
+        # -- Fairness -- differential false-positive rate across groups ---------
         group_a = batch["group"] == "A"
         group_b = batch["group"] == "B"
 
@@ -250,7 +268,7 @@ class Task3Env:
         b_fpr  = b_fp / b_safe if b_safe > 0 else 0.0
 
         fairness_gap   = abs(a_fpr - b_fpr)
-        fairness_score = max(0.0, 1.0 - 2.5 * fairness_gap)  # gap > 0.4 → score 0
+        fairness_score = max(0.0, 1.0 - 2.5 * fairness_gap)  # gap > 0.4 -> score 0
 
         return {
             "toxicity_rate": float(1.0 - safety_score),   # % toxic that got through
@@ -271,10 +289,10 @@ class Task3Env:
     def _compute_reward(self, metrics: Dict[str, Any]) -> float:
         """
         Multi-objective reward per step.  Weights reflect the spec:
-          safety     30%  — toxicity must be controlled
-          engagement 25%  — platform must be usable
-          retention  25%  — users must not churn
-          fairness   20%  — equal treatment across demographic groups
+          safety     30%  -- toxicity must be controlled
+          engagement 25%  -- platform must be usable
+          retention  25%  -- users must not churn
+          fairness   20%  -- equal treatment across demographic groups
         """
         r = (
             0.30 * metrics["safety"]

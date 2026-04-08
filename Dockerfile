@@ -21,8 +21,8 @@ COPY openenv.yaml .
 # HF Spaces runs as non-root on port 7860
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DATASET_PATH=server/data/dataset_final.csv \
-    PYTHONPATH=/app/server
+    DATA_PATH=server/data/dataset_final.csv \
+    PYTHONPATH=/app
         
 EXPOSE 7860
 

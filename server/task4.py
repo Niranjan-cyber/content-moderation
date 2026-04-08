@@ -3,7 +3,7 @@ import random
 import pandas as pd
 from typing import Optional, Dict, Any
 
-from .models import (
+from ..models import (
     Task4Observation,
     Task4Action,
     Task4StepResult,
@@ -27,7 +27,7 @@ class Task4Env:
         self.done = True
         self.appeal_id = 0
 
-    # ─────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------
 
     def reset(self) -> Task4ResetResult:
         idx = self._rng.randint(0, len(self.df) - 1)
@@ -44,7 +44,7 @@ class Task4Env:
             info={"message": "Appeal started"}
         )
 
-    # ─────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------
 
     def step(self, action_model: Task4Action) -> Task4StepResult:
         if self.done:
@@ -57,7 +57,7 @@ class Task4Env:
 
         reward = 0.0
 
-        # 🎯 Correctness
+        # [target] Correctness
         if should_reverse == 1:
             if action == "reverse":
                 reward += 1.0
@@ -69,7 +69,7 @@ class Task4Env:
             elif action == "reverse":
                 reward -= 1.0
 
-        # 🧠 Consistency bonus
+        # [brain] Consistency bonus
         similarity_score = self._compute_similarity_score(row)
         reward += 0.5 * similarity_score
 
@@ -92,7 +92,7 @@ class Task4Env:
             }
         )
 
-    # ─────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------
 
     def _compute_similarity_score(self, row):
         """
@@ -100,16 +100,17 @@ class Task4Env:
         uses dataset signals instead of embeddings
         """
         similar = self.df[
-            (self.df["content_type"] == row["content_type"])
+            (self.df["content_type"] == row["content_type"]) &
+            (abs(self.df["noisy_toxicity_score"] - row["noisy_toxicity_score"]) < 0.2)
         ]
 
         if len(similar) == 0:
             return 0.5
 
-        same_action = (similar["correct_action"] == row["correct_action"]).mean()
+        same_action = (similar["original_action_taken"] == row["original_action_taken"]).mean()
         return float(same_action)
 
-    # ─────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------
 
     def _build_obs(self) -> Task4Observation:
         row = self.current_row
@@ -120,7 +121,7 @@ class Task4Env:
         return Task4Observation(
             appeal_id=self.appeal_id,
             original_post_text=row["text"],
-            original_action_taken=str(row["correct_action"]),
+            original_action_taken=str(row["original_action_taken"]),
             noisy_toxicity_score=row["noisy_toxicity_score"],
             confidence_level=row["confidence_level"],
             user_id=row["user_id"],
@@ -131,7 +132,7 @@ class Task4Env:
             step=self.step_count
         )
 
-    # ─────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------
 
     def state(self) -> Dict[str, Any]:
         return {

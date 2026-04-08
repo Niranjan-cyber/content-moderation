@@ -1,22 +1,37 @@
 name: content-moderation-env
 version: "0.2.0"
 description: >
-  Content Moderation RL Environment — three tasks of increasing complexity
-  that simulate real decisions made by trust & safety teams at scale.
+  CascadeGuard -- Content Moderation RL Environment.
+  Four tasks of increasing complexity simulating real decisions made by
+  trust & safety teams at scale. Built for the Meta OpenEnv Hackathon.
 
-  Task 1 (POMDP):        Single-post decisions under uncertainty.
-  Task 2 (Sequential RL): Multi-step user trajectory control.
-  Task 3 (System RL):    Platform-wide policy optimisation with fairness constraints.
+  Task 1 (POMDP):            Single-post decisions under uncertainty.
+  Task 2 (Sequential RL):    Multi-step user trajectory control.
+  Task 3 (Multi-objective):  Platform-wide policy optimisation with fairness.
+  Task 4 (Meta-Decision RL): Appeals & consistency system.
 
 author: "Team Malhar"
 
+tags:
+  - content-moderation
+  - trust-and-safety
+  - nlp
+  - pomdp
+  - sequential-rl
+  - multi-objective-rl
+  - fairness
+  - openenv
+
+# --- Tasks --------------------------------------------------------------------
+
 tasks:
+
   - name: task1-single-post
     description: >
       Single post moderation under uncertainty (POMDP).
-      The agent receives an IMPERFECT noisy toxicity score and must decide
-      allow / warn / remove. True toxicity is hidden; the agent must learn
-      risk-aware decision making using confidence_level as a calibration signal.
+      The agent receives a noisy toxicity score and must decide allow / warn / remove.
+      True toxicity is hidden. The agent must learn risk-aware decision making
+      using confidence_level as a calibration signal.
     difficulty: easy
     max_steps: 1
     score_range: [0.0, 1.0]
@@ -31,15 +46,16 @@ tasks:
       - noisy_toxicity_score
       - confidence_level
       - follower_bucket
+      - content_type
       - step
 
   - name: task2-user-trajectory
     description: >
       Sequential user behaviour management (True RL).
-      The agent moderates the SAME user across multiple posts.
-      Actions have delayed consequences: too lenient → user escalates;
-      too strict → user churns. Escalation level and violation history
-      give the agent memory of the user's past behaviour.
+      The agent moderates the SAME user across multiple posts over time.
+      Actions have delayed consequences: too lenient causes escalation,
+      too strict causes unfair churn. The agent receives the FULL post history
+      of the user at every step -- not just a summary count.
     difficulty: medium
     max_steps: 10
     score_range: [0.0, 1.0]
@@ -56,11 +72,13 @@ tasks:
       - noisy_toxicity_score
       - confidence_level
       - follower_bucket
+      - content_type
       - user_id
       - day
       - violation_history
       - last_action
       - escalation_level
+      - post_history
       - step
 
   - name: task3-platform-policy
@@ -69,8 +87,9 @@ tasks:
       The agent adjusts global moderation strictness over 20 simulated days.
       Each day, a real batch of posts is processed. Metrics are computed from
       actual dataset labels and group A/B fairness splits.
-      The agent must balance four objectives: safety, engagement, retention,
-      and demographic fairness — exactly as real platforms must.
+      The agent receives the top 5 most urgent active posts AND a platform
+      user behaviour summary -- not just a single sample post.
+      Must balance safety, engagement, retention, and demographic fairness.
     difficulty: hard
     max_steps: 20
     score_range: [0.0, 1.0]
@@ -88,48 +107,115 @@ tasks:
       - fairness_gap
       - group_a_false_positive_rate
       - group_b_false_positive_rate
+      - active_posts
+      - platform_user_summary
       - sample_post_text
       - sample_toxicity_score
       - sample_content_type
       - step
 
-# ─── Global observation schema (Task 1 base; Tasks 2/3 extend this) ──────────
+  - name: task4-appeals
+    description: >
+      Appeals and fairness system (Meta-Decision RL).
+      The agent reviews moderation decisions that users have contested.
+      Must decide uphold / reverse / escalate across 10 appeals per episode.
+      A precedent mechanic enforces consistency -- wrong decisions on earlier
+      appeals create pressure on future similar cases. Scored on both
+      accuracy (0.7 weight) and consistency (0.3 weight).
+    difficulty: hard
+    max_steps: 10
+    score_range: [0.0, 1.0]
+    endpoint: "/reset?task=task4-appeals"
+    actions:
+      - uphold
+      - reverse
+      - escalate
+    observation_fields:
+      - appeal_id
+      - post_id
+      - text
+      - noisy_toxicity_score
+      - confidence_level
+      - content_type
+      - original_action_taken
+      - original_action_label
+      - follower_bucket
+      - precedent_history
+      - step
+
+# --- Observation Space --------------------------------------------------------
+
 observation_space:
   type: object
-  description: "Post-level observation visible to the agent (Task 1 base fields)"
+  description: "Post-level observation (Task 1 base fields; Tasks 2/3/4 extend this)"
+
   properties:
+
     post_id:
       type: integer
       description: "Unique identifier for the post"
+
     text:
       type: string
       description: "Raw post text content"
+
     noisy_toxicity_score:
       type: number
       minimum: 0.0
       maximum: 1.0
-      description: "Imperfect model prediction — NOT ground truth"
+      description: "Imperfect model prediction -- NOT ground truth"
+
     confidence_level:
       type: number
       minimum: 0.0
       maximum: 1.0
-      description: "Model's self-reported confidence in its toxicity score"
+      description: "Model self-reported confidence in its toxicity score"
+
     follower_bucket:
       type: integer
       minimum: 0
       maximum: 2
-      description: "Poster reach: 0=low (<1k), 1=mid (1k-100k), 2=high (>100k)"
+      description: "Poster reach: 0=small (<1k), 1=mid (1k-100k), 2=large (>100k)"
+
+    content_type:
+      type: string
+      description: "Category: hate_speech | threat | sexual | political | humor | personal | news_info | general"
+
     step:
       type: integer
       description: "Current step within the episode"
-  # Task 2 additional fields
+
   task2_extended:
-    user_id:           {type: integer}
-    day:               {type: integer}
-    violation_history: {type: integer, description: "Count of user's past violations"}
-    last_action:       {type: integer, description: "Agent's action on user's prior post (0-4)"}
-    escalation_level:  {type: integer, minimum: 0, maximum: 3}
-  # Task 3 additional fields (platform-level aggregated view)
+    user_id:
+      type: integer
+      description: "Fake user identifier"
+    day:
+      type: integer
+      description: "Day within the user's timeline (1-indexed)"
+    violation_history:
+      type: integer
+      description: "Count of user's past toxic posts"
+    last_action:
+      type: integer
+      description: "Agent's action on user's prior post (0=allow,1=warn,2=restrict,3=remove,4=ban)"
+    escalation_level:
+      type: integer
+      minimum: 0
+      maximum: 3
+      description: "User's current behaviour severity (0=clean, 3=repeat offender)"
+    post_history:
+      type: array
+      description: "Full list of previous posts from this user in this episode"
+      items:
+        type: object
+        properties:
+          day:                  {type: integer}
+          text:                 {type: string}
+          noisy_toxicity_score: {type: number}
+          content_type:         {type: string}
+          action_taken:         {type: integer}
+          action_label:         {type: string}
+
   task3_extended:
     current_day:
       type: integer
@@ -166,44 +252,119 @@ observation_space:
       type: number
       minimum: 0.0
       maximum: 1.0
-    sample_post_text:         {type: string}
-    sample_toxicity_score:    {type: number, minimum: 0.0, maximum: 1.0}
-    sample_content_type:      {type: string}
+    active_posts:
+      type: array
+      description: "Top 5 most urgent posts needing attention today (by toxicity x reach)"
+      items:
+        type: object
+        properties:
+          post_id:              {type: integer}
+          text:                 {type: string}
+          noisy_toxicity_score: {type: number}
+          content_type:         {type: string}
+          follower_bucket:      {type: integer}
+          group:                {type: string}
+    platform_user_summary:
+      type: object
+      description: "Aggregate view of user behaviour across the platform"
+      properties:
+        total_active_users: {type: integer}
+        escalating_users:   {type: integer}
+        improving_users:    {type: integer}
+        banned_today:       {type: integer}
 
-# ─── Action spaces per task ───────────────────────────────────────────────────
+  task4_extended:
+    appeal_id:
+      type: integer
+    original_action_taken:
+      type: integer
+      description: "What the system originally decided (0=allow, 1=warn, 2=remove)"
+    original_action_label:
+      type: string
+    should_reverse:
+      type: integer
+      description: "Ground truth -- hidden from agent. 1=decision was wrong."
+    precedent_history:
+      type: array
+      description: "All previous appeal decisions in this episode -- consistency enforced"
+      items:
+        type: object
+        properties:
+          appeal_number:  {type: integer}
+          text:           {type: string}
+          content_type:   {type: string}
+          original_action:{type: integer}
+          agent_decision: {type: string}
+          was_correct:    {type: boolean}
+
+# --- Action Space -------------------------------------------------------------
+
 action_space:
+
   task1:
     type: string
     enum: [allow, warn, remove]
     description: >
-      allow  — post stays visible, no action
-      warn   — post stays up with a warning label, user notified
-      remove — post taken down immediately
+      allow  -- post stays visible, no action taken
+      warn   -- post stays visible with a warning label, user notified
+      remove -- post taken down immediately
+
   task2:
     type: string
     enum: [allow, warn, restrict, remove, ban]
     description: >
-      allow    — no intervention
-      warn     — soft nudge, user notified
-      restrict — limit user's posting frequency
-      remove   — take down this specific post
-      ban      — remove user from platform (terminal action)
+      allow    -- no intervention
+      warn     -- soft nudge, user notified
+      restrict -- limit user's posting frequency
+      remove   -- take down this specific post
+      ban      -- remove user from platform permanently (terminal action)
+
   task3:
     type: string
     enum: [increase_strictness, decrease_strictness, keep_policy_same]
     description: >
-      increase_strictness — raise auto-mod threshold (+0.1); removes more content
-      decrease_strictness — lower auto-mod threshold (-0.1); allows more content
-      keep_policy_same    — no change this day
+      increase_strictness -- raise auto-mod threshold (+0.1); removes more content
+      decrease_strictness -- lower auto-mod threshold (-0.1); allows more content
+      keep_policy_same    -- no change this day
+
+  task4:
+    type: string
+    enum: [uphold, reverse, escalate]
+    description: >
+      uphold   -- original decision was correct; stand by it
+      reverse  -- original decision was wrong; restore or correct the post
+      escalate -- uncertain; forward to senior human reviewer (partial credit)
+
+# --- Reward Ranges ------------------------------------------------------------
 
 reward_range: [0.0, 1.0]
 
-tags:
-  - content-moderation
-  - trust-and-safety
-  - nlp
-  - pomdp
-  - sequential-rl
-  - multi-objective-rl
-  - fairness
-  - openenv
+reward_description:
+  task1: >
+    +1.0 correct action (bonus for high-severity + large reach).
+    -3.0 false negative (allowed clearly harmful content).
+    -2.0 false positive (removed safe content).
+    -0.5 off-by-one error. Normalised to [0, 1].
+
+  task2: >
+    +1.0 correct moderation action each step.
+    +1.0 bonus for correct ban of persistent offender.
+    -2.0 false negative (allowed toxic post).
+    -2.0 false positive (punished safe user).
+    -1.5 over-escalation (ban at escalation_level < 2).
+    +0.5 rehabilitation reward (allow after user improved).
+    Terminal bonus: 0.3 * (1 - violation_rate).
+
+  task3: >
+    score = 0.35 * safety + 0.30 * engagement + 0.20 * retention + 0.15 * fairness
+    where safety    = 1 - global_toxicity_rate
+          engagement = engagement_score
+          retention  = user_retention_rate
+          fairness   = 1 - fairness_gap
+
+  task4: >
+    +1.0 correct decision (uphold or reverse).
+    +0.3 escalate (safe but indecisive -- partial credit).
+    -1.0 wrong decision.
+    -0.5 consistency penalty (decided differently on similar past case).
+    Episode score = 0.7 * mean_accuracy + 0.3 * consistency_score.

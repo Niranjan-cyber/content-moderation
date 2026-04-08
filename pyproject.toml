@@ -1,0 +1,18 @@
+[project]
+name = "content-mod-env"
+version = "0.1.0"
+description = "Content moderation environment"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "pandas",
+    "numpy",
+    "openai",
+    "requests",
+    "openenv-core>=0.2.0",
+]
+
+[project.scripts]
+server = "server.app:main"

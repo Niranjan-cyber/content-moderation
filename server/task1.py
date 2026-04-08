@@ -15,7 +15,7 @@ Score range:    [0.0, 1.0]
 Reward table:
   Toxic post  (true_toxicity=1): remove=1.0 | warn=0.5 | allow=0.0
   Safe post   (true_toxicity=0): allow=1.0  | warn=0.6 | remove=0.1
-  + Calibration bonus: ±0.1 based on confidence × correctness
+  + Calibration bonus: +/-0.1 based on confidence x correctness
 """
 
 import os
@@ -23,7 +23,7 @@ import random
 import pandas as pd
 from typing import Optional
 
-from .models import Task1Observation, Task1Action, StepResult, ResetResult
+from ..models import Task1Observation, Task1Action, StepResult, ResetResult
 DATA_PATH = os.getenv(
     "DATASET_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dataset_final.csv")
@@ -43,9 +43,9 @@ class Task1Env:
         self._episode_id: int = 0
         self._episode_rewards: list = []  # Track rewards across episodes
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     # OpenEnv interface
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
 
     def reset(self) -> ResetResult:
         """Sample a new post, return initial observation. Starts a fresh episode."""
@@ -68,9 +68,9 @@ class Task1Env:
     def step(self, action: Task1Action) -> StepResult:
         """Execute one moderation decision. Episode ends immediately (single-step)."""
         if self._done:
-            raise RuntimeError("Episode already done — call reset() first.")
+            raise RuntimeError("Episode already done -- call reset() first.")
         if self._current_post is None:
-            raise RuntimeError("No active episode — call reset() first.")
+            raise RuntimeError("No active episode -- call reset() first.")
 
         self._step_count += 1
         reward = self._compute_reward(action.action)
@@ -109,9 +109,9 @@ class Task1Env:
             ) if self._episode_rewards else 0.0,
         }
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     # Internal helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
 
     def _build_observation(self, step: int) -> Task1Observation:
         row = self._current_post
@@ -129,16 +129,16 @@ class Task1Env:
         Shaped reward providing dense signal in [0.0, 1.0].
 
         Base reward encodes severity of decision errors:
-          - False negatives (missing toxic content) are penalised hardest → 0.0
-          - False positives (removing safe content) are penalised → 0.1
-          - Partial actions (warn on toxic) earn partial credit → 0.5
-          - Unnecessary warn on safe content is a mild penalty → 0.6
-          - Correct actions earn full reward → 1.0
+          - False negatives (missing toxic content) are penalised hardest -> 0.0
+          - False positives (removing safe content) are penalised -> 0.1
+          - Partial actions (warn on toxic) earn partial credit -> 0.5
+          - Unnecessary warn on safe content is a mild penalty -> 0.6
+          - Correct actions earn full reward -> 1.0
 
-        Calibration bonus (±0.1) rewards agents that use confidence appropriately:
-          - High confidence (>0.75) + correct decision  → +0.1
-          - High confidence (>0.75) + wrong decision    → -0.1
-          (low confidence decisions have no bonus/penalty — uncertainty acknowledged)
+        Calibration bonus (+/-0.1) rewards agents that use confidence appropriately:
+          - High confidence (>0.75) + correct decision  -> +0.1
+          - High confidence (>0.75) + wrong decision    -> -0.1
+          (low confidence decisions have no bonus/penalty -- uncertainty acknowledged)
         """
         true_tox   = int(self._current_post["true_toxicity"])
         confidence = float(self._current_post["confidence_level"])
@@ -158,4 +158,12 @@ class Task1Env:
         if confidence > 0.75:
             calib = 0.1 if is_correct else -0.1
 
+        # ADD IMPACT-AWARE REWARD
+        follower = int(self._current_post["follower_bucket"])
+
+        if true_tox == 1 and action == "allow":
+            base -= 0.2 * follower
+
+        if true_tox == 1 and action == "remove":
+            base += 0.1 * follower
         return round(min(max(base + calib, 0.0), 1.0), 4)

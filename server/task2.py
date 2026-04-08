@@ -10,7 +10,7 @@ import random
 import pandas as pd
 from typing import Optional, Dict, Any
 
-from .models import Task2Observation, Task2Action, Task2StepResult, Task2ResetResult
+from ..models import Task2Observation, Task2Action, Task2StepResult, Task2ResetResult
 
 DATA_PATH = os.getenv(
     "DATASET_PATH",
@@ -72,6 +72,18 @@ class Task2Env:
         self.agent_action_history.append(action)
         
         post = self.user_posts[self.current_step]
+        # [fire] ADD DYNAMICS (CRITICAL)
+        if self.current_step < len(self.user_posts) - 1:
+            next_post = self.user_posts[self.current_step + 1]
+
+            if action == "warn":
+                next_post["true_toxicity"] = max(0, next_post["true_toxicity"] - 0.2)
+
+            elif action == "allow":
+                next_post["true_toxicity"] = min(1, next_post["true_toxicity"] + 0.2)
+
+            elif action == "restrict":
+                next_post["true_toxicity"] = max(0, next_post["true_toxicity"] - 0.1)
         true_tox = int(post["true_toxicity"])
         
         # Track state dynamically so future observations reflect agent's actual actions
