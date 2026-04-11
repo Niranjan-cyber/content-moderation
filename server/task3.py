@@ -1,26 +1,25 @@
 """
-Task 3: Platform Policy Optimization (System-Level RL)
-======================================================
-The agent acts as Head of Trust & Safety, controlling the platform's global
-moderation STRICTNESS THRESHOLD over a 20-day simulation.
+Task 3: Platform Policy Optimisation (Multi-objective RL)
+==========================================================
+Agent acts as Head of Trust & Safety, controlling global moderation strictness
+over a 20-day simulation. Each day a real batch of posts is processed from
+the dataset. Metrics are computed from actual binary labels (true_toxicity,
+group A/B fairness).
 
-Key difference from toy simulations:
-  - Every day a real batch of posts is sampled from the dataset.
-  - The auto-mod system applies the current threshold: posts whose
-    noisy_toxicity_score exceeds the threshold are removed.
-  - Real group A / B labels from the dataset drive fairness tracking.
-  - The reward function balances four competing objectives:
-      safety (low toxicity), engagement, retention, and fairness.
+Must balance four competing objectives:
+  safety     (0.35) — don't let toxic content through
+  engagement (0.30) — don't over-remove safe content
+  retention  (0.20) — high FPR chases users away
+  fairness   (0.15) — equal treatment across demographic groups A and B
+
+Key mechanics:
+  - Strictness controls auto-mod threshold: threshold = 1.0 - strictness
+  - High strictness → removes more → safer but worse engagement/fairness
+  - Policy inertia: keep_policy_same penalised slightly to prevent lazy no-ops
+  - Episode seed prevents same batch sequence across runs
 
 Episode length: 20 days (steps)
 Score range:    [0.0, 1.0]
-
-Reward formula per step:
-  reward = 0.30 * safety
-         + 0.25 * engagement
-         + 0.25 * retention
-         + 0.20 * fairness
-  where each component is in [0, 1].
 """
 
 import os
@@ -29,293 +28,278 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict, Any, List
 
-from ..models import Task3Observation, Task3Action, Task3StepResult, Task3ResetResult
-
 DATA_PATH = os.getenv(
     "DATASET_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dataset_final.csv")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dataset_final.csv"),
 )
-# How many posts to sample from the dataset each day
-BATCH_SIZE = 50
+
+BATCH_SIZE = 30   # posts per day
 MAX_DAYS   = 20
 
 
 class Task3Env:
-    """
-    Platform-level moderation environment backed by the real dataset.
+    """Platform-level multi-objective policy optimisation environment."""
 
-    State: aggregated platform health metrics computed from a daily batch.
-    Action: increase_strictness | decrease_strictness | keep_policy_same
-
-    Strictness (0.0-1.0) controls the auto-mod threshold:
-        threshold = 1.0 - strictness
-    A post is auto-removed if noisy_toxicity_score > threshold.
-
-    High strictness -> removes more content (good for safety, bad for engagement/fairness).
-    Low strictness  -> allows more content (good for engagement, bad for safety).
-    """
-
-    def __init__(self, data_path: str = DATA_PATH, seed: Optional[int] = None):
-        self._rng = random.Random(seed)
-        np.random.seed(seed if seed is not None else 0)
-
-        raw = pd.read_csv(data_path)
-
-        # Keep only what we need
-        self._df = raw[[
-            "id", "text", "noisy_toxicity_score", "confidence_level",
-            "true_toxicity", "content_type", "group", "is_adversarial",
-        ]].copy()
-        self._df["group"] = self._df["group"].astype(str).str.upper().str.strip()
-
-        # Sanity: ensure group column only has A / B
-        valid_groups = self._df["group"].isin(["A", "B"])
-        if not valid_groups.all():
-            self._df.loc[~valid_groups, "group"] = "A"
-
-        self._all_indices = list(range(len(self._df)))
-        self.reset()
-
-    # --------------------------------------------------------------------------
-    # OpenEnv interface
-    # --------------------------------------------------------------------------
-
-    def reset(self) -> Task3ResetResult:
-        """Start a new 20-day episode with a clean platform state."""
-        self.current_day      = 1
-        self.is_done          = False
-        self.strictness       = 0.5     # Start at neutral
-        self._episode_rewards: List[float] = []
-
-        # Cumulative fairness tracking across the episode
-        self._group_a_fp  = 0           # group A false positives (wrongly removed safe posts)
-        self._group_a_tot = 0           # group A safe posts seen
-        self._group_b_fp  = 0
-        self._group_b_tot = 0
-
-        # Seed initial platform state (day-0 snapshot before any action)
-        self._last_metrics = self._compute_metrics_for_batch(
-            self._sample_batch(), self.strictness
+    def __init__(self, df: pd.DataFrame, seed: Optional[int] = None):
+        self._base_seed = seed if seed is not None else 0
+        self._df        = df.copy()
+        # Normalise group labels
+        self._df["group"] = (
+            self._df["group"].astype(str).str.upper().str.strip()
         )
+        self._df.loc[~self._df["group"].isin(["A", "B"]), "group"] = "A"
+        self._reset_state()
 
-        return Task3ResetResult(
-            observation=self._build_obs(self._last_metrics),
-            done=False,
-            info={"message": "Platform reset to Day 1", "strictness": self.strictness},
-        )
+    # -------------------------------------------------------------------------
 
-    def step(self, action_model: Task3Action) -> Task3StepResult:
-        if self.is_done:
-            raise RuntimeError("Episode is done. Call reset().")
-
-        # -- 1. Apply agent's policy adjustment -------------------------------
-        action = action_model.action
-        if action == "increase_strictness":
-            self.strictness = min(1.0, round(self.strictness + 0.1, 2))
-        elif action == "decrease_strictness":
-            self.strictness = max(0.0, round(self.strictness - 0.1, 2))
-        # keep_policy_same -> no change
-
-        # -- 2. Simulate the day: sample a real batch and apply threshold ------
-        batch    = self._sample_batch()
-        metrics  = self._compute_metrics_for_batch(batch, self.strictness)
-        self._last_metrics = metrics
-
-        # Update cumulative fairness counters
-        self._group_a_fp  += metrics["_a_fp"]
-        self._group_a_tot += metrics["_a_safe_total"]
-        self._group_b_fp  += metrics["_b_fp"]
-        self._group_b_tot += metrics["_b_safe_total"]
-
-        # -- 3. Multi-objective reward -----------------------------------------
-        reward = self._compute_reward(metrics)
-        self._episode_rewards.append(reward)
-
-        # -- 4. Episode boundary -----------------------------------------------
-        self.current_day += 1
-        if self.current_day > MAX_DAYS:
-            self.is_done = True
-
-        # Pick a sample post to show in observation (grounds the agent)
-        sample_idx = self._rng.randint(0, len(batch) - 1)
-        sample_row = batch.iloc[sample_idx]
-
-        obs = Task3Observation(
-            current_day=self.current_day,
-            global_toxicity_rate=round(metrics["toxicity_rate"],       4),
-            engagement_score     =round(metrics["engagement"],         4),
-            user_retention_rate  =round(metrics["retention"],          4),
-            moderation_strictness_level=round(self.strictness,         4),
-            fairness_gap         =round(metrics["fairness_gap"],       4),
-            group_a_false_positive_rate=round(metrics["a_fpr"],        4),
-            group_b_false_positive_rate=round(metrics["b_fpr"],        4),
-            sample_post_text     =str(sample_row["text"])[:200],
-            sample_toxicity_score=round(float(sample_row["noisy_toxicity_score"]), 4),
-            sample_content_type  =str(sample_row["content_type"]),
-            step=self.current_day - 1,
-        )
-
-        return Task3StepResult(
-            observation=obs,
-            reward=round(reward, 4),
-            done=self.is_done,
-            info={
-                "action":          action,
-                "strictness":      self.strictness,
-                "toxicity_rate":   round(metrics["toxicity_rate"],   4),
-                "engagement":      round(metrics["engagement"],      4),
-                "retention":       round(metrics["retention"],       4),
-                "fairness_gap":    round(metrics["fairness_gap"],    4),
-                "threshold_used":  round(1.0 - self.strictness,     4),
+    def reset(self) -> Dict[str, Any]:
+        self._episode_seed  = random.randint(0, 999_999)
+        self._rng           = random.Random(self._episode_seed)
+        self._day           = 1
+        self._strictness    = 0.5
+        self._done          = False
+        self._rewards:  List[float] = []
+        self._no_op_streak  = 0
+        self._current_batch = self._sample_batch(day=0)
+        metrics = self._compute_metrics(self._current_batch, self._strictness)
+        obs = self._build_obs(metrics)
+        return {
+            "observation": obs,
+            "done":        False,
+            "info":        {
+                "message":    "Platform reset to Day 1",
+                "strictness": self._strictness,
+                "episode_seed": self._episode_seed,
             },
-        )
+        }
+
+    def step(self, action: str) -> Dict[str, Any]:
+        if self._done:
+            raise RuntimeError("Episode done — call reset() first.")
+
+        # 1. Apply policy adjustment
+        delta = {"increase_strictness": +0.1, "decrease_strictness": -0.1, "keep_policy_same": 0.0}[action]
+        self._strictness = round(max(0.0, min(1.0, self._strictness + delta)), 2)
+
+        # 2. Track inaction streak (anti-hedging)
+        if action == "keep_policy_same":
+            self._no_op_streak += 1
+        else:
+            self._no_op_streak = 0
+
+        # 3. Simulate the day
+        batch   = self._sample_batch(day=self._day)
+        metrics = self._compute_metrics(batch, self._strictness)
+        self._current_batch = batch
+
+        # 4. Compute reward
+        reward = self._compute_reward(metrics, action)
+        self._rewards.append(reward)
+
+        self._day += 1
+        self._done = self._day > MAX_DAYS
+
+        obs = {} if self._done else self._build_obs(metrics)
+        return {
+            "observation": obs,
+            "reward":      round(reward, 4),
+            "done":        self._done,
+            "info": {
+                "day":              int(self._day - 1),
+                "strictness":       self._strictness,
+                "global_toxicity_rate": metrics["toxicity_rate"],
+                "engagement_score":     metrics["engagement"],
+                "user_retention_rate":  metrics["retention"],
+                "fairness_gap":         metrics["fairness_gap"],
+                "group_a_fpr":          metrics["a_fpr"],
+                "group_b_fpr":          metrics["b_fpr"],
+                "mean_episode_reward":  round(
+                    sum(self._rewards) / max(1, len(self._rewards)), 4
+                ),
+                "score": round(reward, 4),
+            },
+        }
 
     def state(self) -> Dict[str, Any]:
         m = self._last_metrics
         return {
-            "day":          self.current_day,
-            "strictness":   self.strictness,
-            "done":         self.is_done,
-            "mean_reward":  round(
-                sum(self._episode_rewards) / len(self._episode_rewards), 4
-            ) if self._episode_rewards else 0.0,
-            "toxicity_rate":   round(m.get("toxicity_rate", 0), 4),
-            "engagement":      round(m.get("engagement", 0), 4),
-            "retention":       round(m.get("retention", 0), 4),
-            "fairness_gap":    round(m.get("fairness_gap", 0), 4),
+            "day":        self._day,
+            "strictness": self._strictness,
+            "done":       self._done,
+            "mean_reward": round(
+                sum(self._rewards) / max(1, len(self._rewards)), 4
+            ) if self._rewards else 0.0,
+            "toxicity_rate": round(m.get("toxicity_rate", 0), 4),
+            "engagement":    round(m.get("engagement", 0), 4),
+            "retention":     round(m.get("retention", 0), 4),
+            "fairness_gap":  round(m.get("fairness_gap", 0), 4),
         }
 
-    # --------------------------------------------------------------------------
-    # Internal helpers
-    # --------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
-    def _sample_batch(self) -> pd.DataFrame:
+    def _reset_state(self):
+        self._episode_seed   = 0
+        self._rng            = random.Random(0)
+        self._day            = 1
+        self._strictness     = 0.5
+        self._done           = True
+        self._rewards:  List[float] = []
+        self._no_op_streak   = 0
+        self._current_batch  = pd.DataFrame()
+        self._last_metrics: Dict = {}
+
+    def _sample_batch(self, day: int) -> pd.DataFrame:
         """
-        Policy-dependent sampling (CRITICAL)
+        Sample a batch of BATCH_SIZE posts for the current day.
+        Uses episode seed + day offset so different episodes see different data,
+        but within an episode each day is deterministic (reproducible).
         """
-        if self.strictness > 0.7:
-            # Strict platform -> users behave better
-            safe_posts = self._df[self._df["true_toxicity"] == 0]
-            toxic_posts = self._df[self._df["true_toxicity"] == 1]
+        rng_state = self._episode_seed + day * 31
+        return self._df.sample(
+            min(BATCH_SIZE, len(self._df)),
+            random_state=rng_state,
+            replace=False,
+        ).reset_index(drop=True)
 
-            safe_sample = safe_posts.sample(int(BATCH_SIZE * 0.7), replace=True)
-            toxic_sample = toxic_posts.sample(int(BATCH_SIZE * 0.3), replace=True)
-
-        else:
-            # Lenient platform -> more toxicity appears
-            safe_posts = self._df[self._df["true_toxicity"] == 0]
-            toxic_posts = self._df[self._df["true_toxicity"] == 1]
-
-            safe_sample = safe_posts.sample(int(BATCH_SIZE * 0.5), replace=True)
-            toxic_sample = toxic_posts.sample(int(BATCH_SIZE * 0.5), replace=True)
-
-        batch = pd.concat([safe_sample, toxic_sample])
-        return batch.sample(frac=1).reset_index(drop=True)
-
-    def _compute_metrics_for_batch(
-        self, batch: pd.DataFrame, strictness: float
-    ) -> Dict[str, Any]:
+    def _compute_metrics(self, batch: pd.DataFrame, strictness: float) -> Dict[str, Any]:
         """
-        Simulate a day's auto-moderation and compute platform health metrics.
+        Simulate one day of auto-moderation with current strictness threshold.
+        All metrics derived from real dataset labels (true_toxicity, group).
 
-        Decision rule: auto-remove post if noisy_toxicity_score > threshold
-        where threshold = 1.0 - strictness.
-
-        Returns a dict with all metric components plus internal counters
-        (prefixed with _) for cumulative fairness tracking.
+        Auto-mod decision: remove post if noisy_toxicity_score ≥ threshold
+        where threshold = 1.0 - strictness
         """
-        threshold = 1.0 - strictness
+        threshold = round(1.0 - strictness, 2)
 
-        # Apply decision
-        _noise = np.random.normal(0, 0.18, size=len(batch))
-        _effective_scores = np.clip(batch["noisy_toxicity_score"].values + _noise, 0.0, 1.0)
-        decisions = (_effective_scores > threshold).astype(int)
+        # Add small realistic noise to scores (model is not perfectly calibrated)
+        np.random.seed(self._episode_seed + self._day)
+        noisy_scores = np.clip(
+            batch["noisy_toxicity_score"].values + np.random.normal(0, 0.05, len(batch)),
+            0.0, 1.0
+        )
+        removed = noisy_scores >= threshold
 
-        # 0 = allowed,  1 = removed
+        true_tox    = batch["true_toxicity"].values
+        safe        = ~true_tox.astype(bool)
 
-        true_tox  = batch["true_toxicity"].values
+        n_toxic  = true_tox.sum()
+        n_safe   = safe.sum()
 
-        # -- Safety -----------------------------------------------------------
-        # Fraction of truly toxic posts that slipped through (false negatives)
-        n_toxic = true_tox.sum()
-        fn = ((true_tox == 1) & (decisions == 0)).sum()   # toxic + allowed = false neg
-        miss_rate     = fn / n_toxic if n_toxic > 0 else 0.0
-        safety_score  = 1.0 - miss_rate                   # higher = better
+        # False negatives: toxic posts that were allowed through
+        fn = (true_tox.astype(bool) & ~removed).sum()
+        # False positives: safe posts incorrectly removed
+        fp = (safe & removed).sum()
+        # True negatives: safe posts correctly allowed
+        tn = (safe & ~removed).sum()
 
-        # -- Engagement -------------------------------------------------------
-        # Fraction of SAFE posts that were allowed (false positives hurt engagement)
-        n_safe  = (true_tox == 0).sum()
-        safe_allowed = ((true_tox == 0) & (decisions == 0)).sum()
-        engagement = safe_allowed / n_safe if n_safe > 0 else 1.0
-        # Penalise slightly for excessive strictness even on correct removals
-        fp_rate    = 1.0 - engagement
-        engagement = max(0.0, engagement - 0.1 * fp_rate)  # light engagement drag
+        toxicity_rate = fn / max(1, n_toxic)   # lower = better (safety)
+        engagement    = tn / max(1, n_safe)    # higher = better
+        fpr_overall   = fp / max(1, n_safe)
+        retention     = max(0.0, 1.0 - fpr_overall * 1.5)  # penalise over-removal
 
-        # -- Retention --------------------------------------------------------
-        # High false-positive rate erodes retention; harshness is quadratic
-        retention = max(0.0, 1.0 - (fp_rate ** 1.5))
-
-        # -- Fairness -- differential false-positive rate across groups ---------
+        # Fairness: differential false-positive rate between groups A and B
         group_a = batch["group"] == "A"
         group_b = batch["group"] == "B"
 
-        a_safe = ((true_tox == 0) & group_a.values).sum()
-        b_safe = ((true_tox == 0) & group_b.values).sum()
-        a_fp   = ((true_tox == 0) & group_a.values & (decisions == 1)).sum()
-        b_fp   = ((true_tox == 0) & group_b.values & (decisions == 1)).sum()
+        def group_fpr(mask: np.ndarray) -> float:
+            safe_in_group = safe & mask
+            n = safe_in_group.sum()
+            if n == 0:
+                return 0.0
+            return float((safe_in_group & removed).sum() / n)
 
-        a_fpr  = a_fp / a_safe if a_safe > 0 else 0.0
-        b_fpr  = b_fp / b_safe if b_safe > 0 else 0.0
+        a_fpr = group_fpr(group_a.values)
+        b_fpr = group_fpr(group_b.values)
+        fairness_gap = abs(a_fpr - b_fpr)
 
-        fairness_gap   = abs(a_fpr - b_fpr)
-        fairness_score = max(0.0, 1.0 - 2.5 * fairness_gap)  # gap > 0.4 -> score 0
+        # Platform user behaviour summary (from full dataset, not just batch)
+        full_users = self._df[self._df["user_id"] > 0]
+        esc_col    = full_users["escalation_level"] if "escalation_level" in full_users.columns else pd.Series([0])
+
+        self._last_metrics = {
+            "toxicity_rate": round(float(toxicity_rate), 4),
+            "engagement":    round(float(min(1.0, max(0.0, engagement))), 4),
+            "retention":     round(float(min(1.0, max(0.0, retention))), 4),
+            "fairness_gap":  round(float(fairness_gap), 4),
+            "a_fpr":         round(float(a_fpr), 4),
+            "b_fpr":         round(float(b_fpr), 4),
+            "safety":        round(float(1.0 - toxicity_rate), 4),
+            "fairness_score":round(float(max(0.0, 1.0 - 2.5 * fairness_gap)), 4),
+            "_batch":        batch,
+            "_platform_summary": {
+                "total_active_users": int(self._df["user_id"].nunique()),
+                "escalating_users":   int((esc_col >= 2).sum()),
+                "improving_users":    int((esc_col == 0).sum()),
+                "banned_today":       0,
+            },
+        }
+        return self._last_metrics
+
+    def _compute_reward(self, metrics: Dict[str, Any], action: str) -> float:
+        """
+        Multi-objective reward. Weights match openenv.yaml spec:
+          safety (0.35) + engagement (0.30) + retention (0.20) + fairness (0.15)
+
+        Penalty modifiers:
+          - keep_policy_same streak ≥ 3 days: -0.03 (stop being passive)
+          - keep_policy_same single step:      -0.01 (small time cost)
+          - fairness_gap > 0.3:               additional -0.05
+        """
+        base = (
+            0.35 * metrics["safety"] +
+            0.30 * metrics["engagement"] +
+            0.20 * metrics["retention"] +
+            0.15 * metrics["fairness_score"]
+        )
+
+        # Policy inertia penalty
+        if action == "keep_policy_same":
+            inertia_pen = 0.03 if self._no_op_streak >= 3 else 0.01
+            base -= inertia_pen
+
+        # Extra fairness penalty when gap is large
+        if metrics["fairness_gap"] > 0.3:
+            base -= 0.05
+
+        return float(max(0.0, min(1.0, base)))
+
+    def _build_obs(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Build full platform observation including top-5 urgent posts."""
+        batch = metrics.get("_batch", self._current_batch)
+        if len(batch) == 0:
+            batch = self._current_batch
+
+        # Top 5 most urgent posts: sorted by toxicity × reach
+        urgency = batch["noisy_toxicity_score"] * (batch["follower_bucket"] + 1)
+        top5    = batch.assign(_urgency=urgency).nlargest(5, "_urgency")
+
+        active_posts = [
+            {
+                "post_id":             int(r["id"]),
+                "text":                str(r["text"])[:150],
+                "noisy_toxicity_score":round(float(r["noisy_toxicity_score"]), 4),
+                "content_type":        str(r["content_type"]),
+                "follower_bucket":     int(r["follower_bucket"]),
+                "group":               str(r["group"]),
+            }
+            for _, r in top5.iterrows()
+        ]
+
+        sample = top5.iloc[0] if len(top5) > 0 else batch.iloc[0]
 
         return {
-            "toxicity_rate": float(1.0 - safety_score),   # % toxic that got through
-            "safety":        float(safety_score),
-            "engagement":    float(min(1.0, max(0.0, engagement))),
-            "retention":     float(min(1.0, max(0.0, retention))),
-            "fairness_gap":  float(fairness_gap),
-            "fairness":      float(max(0.0, fairness_score)),
-            "a_fpr":         float(a_fpr),
-            "b_fpr":         float(b_fpr),
-            # Internal counters for cumulative tracking
-            "_a_fp":         int(a_fp),
-            "_a_safe_total": int(a_safe),
-            "_b_fp":         int(b_fp),
-            "_b_safe_total": int(b_safe),
+            "current_day":                 self._day,
+            "global_toxicity_rate":        metrics["toxicity_rate"],
+            "engagement_score":            metrics["engagement"],
+            "user_retention_rate":         metrics["retention"],
+            "moderation_strictness_level": round(self._strictness, 4),
+            "fairness_gap":                metrics["fairness_gap"],
+            "group_a_false_positive_rate": metrics["a_fpr"],
+            "group_b_false_positive_rate": metrics["b_fpr"],
+            "sample_post_text":            str(sample["text"])[:150],
+            "sample_toxicity_score":       round(float(sample["noisy_toxicity_score"]), 4),
+            "sample_content_type":         str(sample["content_type"]),
+            "active_posts":                active_posts,
+            "platform_user_summary":       metrics["_platform_summary"],
+            "step":                        self._day,
         }
-
-    def _compute_reward(self, metrics: Dict[str, Any]) -> float:
-        """
-        Multi-objective reward per step.  Weights reflect the spec:
-          safety     30%  -- toxicity must be controlled
-          engagement 25%  -- platform must be usable
-          retention  25%  -- users must not churn
-          fairness   20%  -- equal treatment across demographic groups
-        """
-        r = (
-            0.30 * metrics["safety"]
-          + 0.25 * metrics["engagement"]
-          + 0.25 * metrics["retention"]
-          + 0.20 * metrics["fairness"]
-        )
-        return float(min(1.0, max(0.0, r)))
-
-    def _build_obs(self, metrics: Dict[str, Any]) -> Task3Observation:
-        """Build initial observation (before any post is sampled for display)."""
-        sample_row = self._df.iloc[self._rng.randint(0, len(self._df) - 1)]
-        return Task3Observation(
-            current_day=1,
-            global_toxicity_rate       =round(metrics.get("toxicity_rate", 0.2), 4),
-            engagement_score           =round(metrics.get("engagement",    0.8), 4),
-            user_retention_rate        =round(metrics.get("retention",     0.9), 4),
-            moderation_strictness_level=round(self.strictness,             4),
-            fairness_gap               =round(metrics.get("fairness_gap",  0.0), 4),
-            group_a_false_positive_rate=round(metrics.get("a_fpr",         0.0), 4),
-            group_b_false_positive_rate=round(metrics.get("b_fpr",         0.0), 4),
-            sample_post_text           =str(sample_row["text"])[:200],
-            sample_toxicity_score      =round(float(sample_row["noisy_toxicity_score"]), 4),
-            sample_content_type        =str(sample_row["content_type"]),
-            step=1,
-        )

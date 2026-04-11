@@ -1,169 +1,175 @@
 """
 Task 1: Single Post Moderation Under Uncertainty (POMDP)
 =========================================================
-The agent sees ONE post per episode and must decide: allow / warn / remove.
+Agent sees ONE post per episode: noisy toxicity signal, confidence, reach, content type.
+Must decide: allow / warn / remove.
 
-Key RL challenge:
-  - noisy_toxicity_score is an IMPERFECT signal (not the ground truth)
-  - true_toxicity is HIDDEN from the agent
-  - confidence_level tells the agent how much to trust the noisy signal
-  - The agent must learn risk-aware decision making
+Ground truth (true_toxicity) is HIDDEN from the agent.
+Reward is computed from true_toxicity after the decision.
 
-Episode length: 1 step (single moderation decision)
+RL challenge:
+  - noisy_toxicity_score is an imperfect signal (not ground truth)
+  - confidence_level calibrates how much to trust it
+  - content_type encodes severity class (hate_speech/threat >> general)
+  - follower_bucket amplifies impact of wrong calls on high-reach posts
+
+Episode length: 1 step
 Score range:    [0.0, 1.0]
-
-Reward table:
-  Toxic post  (true_toxicity=1): remove=1.0 | warn=0.5 | allow=0.0
-  Safe post   (true_toxicity=0): allow=1.0  | warn=0.6 | remove=0.1
-  + Calibration bonus: +/-0.1 based on confidence x correctness
 """
 
 import os
 import random
 import pandas as pd
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from ..models import Task1Observation, Task1Action, StepResult, ResetResult
 DATA_PATH = os.getenv(
     "DATASET_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dataset_final.csv")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dataset_final.csv"),
 )
 
+# Content severity tiers (affect FN penalty magnitude)
+HIGH_SEVERITY   = {"hate_speech", "threat", "sexual"}
+MEDIUM_SEVERITY = {"political", "personal"}
+LOW_SEVERITY    = {"humor", "news_info", "general"}
+
+# Per-bucket impact multiplier (high reach = higher stakes)
+REACH_MULT = {0: 1.0, 1: 1.2, 2: 1.5}
+
+# Per-severity FN multiplier (missing harmful content is worse for severe types)
+SEVERITY_MULT = {
+    **{k: 1.5 for k in HIGH_SEVERITY},
+    **{k: 1.0 for k in MEDIUM_SEVERITY},
+    **{k: 0.8 for k in LOW_SEVERITY},
+}
+
+ACTION_LABELS = {0: "allow", 1: "warn", 2: "remove"}
+ACTION_CODES  = {"allow": 0, "warn": 1, "remove": 2}
+
+
 class Task1Env:
+    """Single-post POMDP moderation environment."""
 
-    ACTION_LABELS = {0: "allow", 1: "warn", 2: "remove"}
-    ACTION_CODES  = {"allow": 0, "warn": 1, "remove": 2}
-
-    def __init__(self, data_path: str = DATA_PATH, seed: Optional[int] = None):
-        self.df = pd.read_csv(data_path)
+    def __init__(self, df: pd.DataFrame, seed: Optional[int] = None):
+        self.df   = df
         self._rng = random.Random(seed)
-        self._current_post: Optional[pd.Series] = None
-        self._step_count: int = 0
-        self._done: bool = True           # Force reset() before first step
-        self._episode_id: int = 0
-        self._episode_rewards: list = []  # Track rewards across episodes
+        self._row: Optional[pd.Series] = None
+        self._done       = True
+        self._episode_id = 0
+        self._rewards: list = []
 
-    # --------------------------------------------------------------------------
-    # OpenEnv interface
-    # --------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
-    def reset(self) -> ResetResult:
-        """Sample a new post, return initial observation. Starts a fresh episode."""
-        idx = self._rng.randint(0, len(self.df) - 1)
-        self._current_post = self.df.iloc[idx]
-        self._step_count = 0
+    def reset(self) -> Dict[str, Any]:
+        idx        = self._rng.randint(0, len(self.df) - 1)
+        self._row  = self.df.iloc[idx]
         self._done = False
         self._episode_id += 1
-
-        return ResetResult(
-            observation=self._build_observation(step=0),
-            done=False,
-            info={
-                "episode_id": self._episode_id,
-                "task": "task1-single-post",
-                "hint": "noisy_toxicity_score is imperfect. Use confidence_level to calibrate.",
-            },
-        )
-
-    def step(self, action: Task1Action) -> StepResult:
-        """Execute one moderation decision. Episode ends immediately (single-step)."""
-        if self._done:
-            raise RuntimeError("Episode already done -- call reset() first.")
-        if self._current_post is None:
-            raise RuntimeError("No active episode -- call reset() first.")
-
-        self._step_count += 1
-        reward = self._compute_reward(action.action)
-        self._done = True
-        self._episode_rewards.append(reward)
-
-        true_tox = int(self._current_post["true_toxicity"])
-        correct_label = self.ACTION_LABELS[int(self._current_post["correct_action"])]
-
-        return StepResult(
-            observation=self._build_observation(step=self._step_count),
-            reward=reward,
-            done=True,
-            info={
-                "episode_id":     self._episode_id,
-                "true_toxicity":  true_tox,
-                "correct_action": correct_label,
-                "action_taken":   action.action,
-                "is_adversarial": bool(self._current_post["is_adversarial"]),
-                "false_positive": true_tox == 0 and action.action == "remove",
-                "false_negative": true_tox == 1 and action.action == "allow",
-                "group":          str(self._current_post["group"]),
-            },
-        )
-
-    def state(self) -> dict:
-        """Return current internal state (for OpenEnv state() endpoint)."""
         return {
-            "episode_id":       self._episode_id,
-            "step_count":       self._step_count,
-            "done":             self._done,
-            "current_post_id":  int(self._current_post["id"]) if self._current_post is not None else None,
-            "episodes_run":     self._episode_id,
-            "mean_reward":      round(
-                sum(self._episode_rewards) / len(self._episode_rewards), 4
-            ) if self._episode_rewards else 0.0,
+            "observation": self._build_obs(step=0),
+            "done":        False,
+            "info":        {"episode_id": self._episode_id, "task": "task1-single-post"},
         }
 
-    # --------------------------------------------------------------------------
-    # Internal helpers
-    # --------------------------------------------------------------------------
+    def step(self, action: str) -> Dict[str, Any]:
+        if self._done:
+            raise RuntimeError("Episode done — call reset() first.")
 
-    def _build_observation(self, step: int) -> Task1Observation:
-        row = self._current_post
-        return Task1Observation(
-            post_id=int(row["id"]),
-            text=str(row["text"]),
-            noisy_toxicity_score=round(float(row["noisy_toxicity_score"]), 6),
-            confidence_level=round(float(row["confidence_level"]), 6),
-            follower_bucket=int(row["follower_bucket"]),
-            step=step,
-        )
+        reward     = self._compute_reward(action)
+        self._done = True
+        self._rewards.append(reward)
+
+        row      = self._row
+        true_tox = int(row["true_toxicity"])
+
+        return {
+            "observation": self._build_obs(step=1),
+            "reward":      reward,
+            "done":        True,
+            "info": {
+                "true_toxicity":  true_tox,
+                "action_taken":   action,
+                "false_positive": true_tox == 0 and action == "remove",
+                "false_negative": true_tox == 1 and action == "allow",
+                "group":          str(row["group"]),
+                "content_type":   str(row["content_type"]),
+                "follower_bucket":int(row["follower_bucket"]),
+                "score":          reward,
+            },
+        }
+
+    def state(self) -> Dict[str, Any]:
+        return {
+            "episode_id":  self._episode_id,
+            "done":        self._done,
+            "mean_reward": round(sum(self._rewards) / max(1, len(self._rewards)), 4),
+        }
+
+    # -------------------------------------------------------------------------
+
+    def _build_obs(self, step: int) -> Dict[str, Any]:
+        row = self._row
+        return {
+            "post_id":             int(row["id"]),
+            "text":                str(row["text"]),
+            "noisy_toxicity_score":round(float(row["noisy_toxicity_score"]), 4),
+            "confidence_level":    round(float(row["confidence_level"]), 4),
+            "follower_bucket":     int(row["follower_bucket"]),
+            "content_type":        str(row["content_type"]),
+            "step":                step,
+        }
 
     def _compute_reward(self, action: str) -> float:
         """
-        Shaped reward providing dense signal in [0.0, 1.0].
+        Reward grounded in true_toxicity (hidden from agent, used only for grading).
 
-        Base reward encodes severity of decision errors:
-          - False negatives (missing toxic content) are penalised hardest -> 0.0
-          - False positives (removing safe content) are penalised -> 0.1
-          - Partial actions (warn on toxic) earn partial credit -> 0.5
-          - Unnecessary warn on safe content is a mild penalty -> 0.6
-          - Correct actions earn full reward -> 1.0
+        Base rewards:
+          Toxic post  (true_tox=1): remove=+1.0 | warn=+0.4 | allow=-1.0
+          Safe post   (true_tox=0): allow=+1.0  | warn=+0.4 | remove=-0.8
 
-        Calibration bonus (+/-0.1) rewards agents that use confidence appropriately:
-          - High confidence (>0.75) + correct decision  -> +0.1
-          - High confidence (>0.75) + wrong decision    -> -0.1
-          (low confidence decisions have no bonus/penalty -- uncertainty acknowledged)
+        Modifiers:
+          Severity multiplier — high-severity toxic FNs penalised harder (×1.5)
+          Reach multiplier    — large accounts have higher stakes (×1.0–1.5)
+          Calibration bonus   — correct at high confidence: +0.1; wrong at high conf: -0.1
+          Anti-hedging        — "warn" on a clear-signal post gives less than decisive action
+
+        Normalised to [0, 1]:
+          raw range ≈ [-2.25, 1.65] → (raw + 2.25) / 4.0
         """
-        true_tox   = int(self._current_post["true_toxicity"])
-        confidence = float(self._current_post["confidence_level"])
+        row        = self._row
+        true_tox   = int(row["true_toxicity"])
+        confidence = float(row["confidence_level"])
+        follower   = int(row["follower_bucket"])
+        ctype      = str(row["content_type"])
 
-        # Base rewards
+        # Base reward
         if true_tox == 1:
-            base = {"remove": 1.0, "warn": 0.5, "allow": 0.0}[action]
+            base = {"remove": 1.0, "warn": 0.4, "allow": -1.0}[action]
+            # Severity amplification on FN (allowed toxic content)
+            if action == "allow":
+                sev = SEVERITY_MULT.get(ctype, 1.0)
+                base *= sev
         else:
-            base = {"allow": 1.0, "warn": 0.6, "remove": 0.1}[action]
+            base = {"allow": 1.0, "warn": 0.4, "remove": -0.8}[action]
 
-        # Calibration signal
+        # Reach multiplier (high reach = higher stakes for errors)
+        reach = REACH_MULT.get(follower, 1.0)
+        base *= reach
+
+        # Calibration bonus/penalty (rewards agents that use confidence correctly)
         is_correct = (
             (true_tox == 1 and action in ("warn", "remove")) or
             (true_tox == 0 and action in ("allow", "warn"))
         )
         calib = 0.0
-        if confidence > 0.75:
+        if confidence > 0.8:
             calib = 0.1 if is_correct else -0.1
 
-        # ADD IMPACT-AWARE REWARD
-        follower = int(self._current_post["follower_bucket"])
+        # Anti-hedging: if signal is unambiguous, "warn" is evasive
+        # Unambiguous = high confidence AND (very high OR very low noisy score)
+        noisy = float(row["noisy_toxicity_score"])
+        is_unambiguous = confidence > 0.85 and (noisy > 0.6 or noisy < 0.15)
+        hedge_penalty = -0.15 if (action == "warn" and is_unambiguous) else 0.0
 
-        if true_tox == 1 and action == "allow":
-            base -= 0.2 * follower
-
-        if true_tox == 1 and action == "remove":
-            base += 0.1 * follower
-        return round(min(max(base + calib, 0.0), 1.0), 4)
+        raw   = base + calib + hedge_penalty
+        score = (raw + 2.25) / 4.0
+        return round(max(0.0, min(1.0, score)), 4)
