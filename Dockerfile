@@ -17,6 +17,7 @@ COPY --from=builder /install /usr/local
 COPY server/   ./server/
 
 COPY openenv.yaml .
+COPY inference.py .
 
 # HF Spaces runs as non-root on port 7860
 ENV PYTHONDONTWRITEBYTECODE=1 \

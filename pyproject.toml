@@ -1,18 +1,22 @@
 [project]
 name = "content-mod-env"
-version = "0.1.0"
-description = "Content moderation environment"
+version = "0.2.0"
+description = "CascadeGuard Content Moderation RL Environment"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi",
-    "uvicorn",
-    "pydantic",
-    "pandas",
-    "numpy",
-    "openai",
-    "requests",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "openai>=1.25",
+    "requests>=2.31",
     "openenv-core>=0.2.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project.scripts]
 server = "server.app:main"

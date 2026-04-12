@@ -26,7 +26,7 @@ from openai import OpenAI
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-API_KEY      = os.getenv("HF_TOKEN", "") or os.getenv("API_KEY", "")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
@@ -477,7 +477,7 @@ def main() -> None:
     run_task(client, "task1-single-post",     max_steps=3)   # 1-step task, 3 for safety
     run_task(client, "task2-user-trajectory", max_steps=12)
     run_task(client, "task3-platform-policy", max_steps=22)  # 20 days + buffer
-    run_task(client, "task4-appeals",         max_steps=12)  # 10 appeals + buffer
+    run_task(client, "task4-appeals",         max_steps=10)  # 10 appeals
 
 
 if __name__ == "__main__":

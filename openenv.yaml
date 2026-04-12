@@ -1,5 +1,7 @@
 name: content-moderation-env
 version: "0.2.0"
+api_version: "0.1"
+homepage: "https://huggingface.co/spaces/NiranjanIyer/content-moderation-env"
 description: >
   CascadeGuard -- Content Moderation RL Environment.
   Four tasks of increasing complexity simulating real decisions made by
@@ -281,9 +283,6 @@ observation_space:
       description: "What the system originally decided (0=allow, 1=warn, 2=remove)"
     original_action_label:
       type: string
-    should_reverse:
-      type: integer
-      description: "Ground truth -- hidden from agent. 1=decision was wrong."
     precedent_history:
       type: array
       description: "All previous appeal decisions in this episode -- consistency enforced"
